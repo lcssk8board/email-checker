@@ -35,25 +35,33 @@ namespace EmailChecker
 
                 foreach (var provider in allProviders)
                 {
-                    var mxInfo = await FindServerInfoAsync(provider.Key);
-                    var allProvidersInfo = ParseMxServerResults(mxInfo);
-
-                    var mxToUse = allProvidersInfo.OrderBy(
-                        p => p.Preference
-                    ).First();
-
-                    var emailsChecked = await CheckEmailAddresses(
-                        provider.Value,
-                        mxToUse.Address,
-                        SMTP_PORT
-                    );
-
-                    foreach (var email in emailsChecked)
+                    try
                     {
-                        emailsChecklist.Add(
-                            email.Key,
-                            email.Value
+                        var mxInfo = await FindServerInfoAsync(provider.Key);
+                        var allProvidersInfo = ParseMxServerResults(mxInfo);
+
+                        var mxToUse = allProvidersInfo.OrderBy(
+                            p => p.Preference
+                        ).First();
+
+                        var emailsChecked = await CheckEmailsOrquestrator(
+                            32,
+                            provider.Value,
+                            mxToUse.Address,
+                            SMTP_PORT
                         );
+
+                        foreach (var email in emailsChecked)
+                        {
+                            emailsChecklist.Add(
+                                email.Key,
+                                email.Value
+                            );
+                        }
+                    }
+                    catch(Exception ex)
+                    {
+                        Console.WriteLine(ex.Message);
                     }
                 }
 
@@ -211,35 +219,73 @@ namespace EmailChecker
             return mailExchangerList;
         }
 
-        static async Task<IReadOnlyDictionary<string, EmailInfo>> CheckEmailAddresses(
+        static async Task<IReadOnlyDictionary<string, EmailInfo>> CheckEmailsOrquestrator(
+            int maxExecutions,
             IEnumerable<string> emails,
             string mxHostAddress,
             int port
         )
         {
-            var emailsChecklist = new Dictionary<string, EmailInfo>(emails.Count());
+            var emailsChecklist = new Dictionary<string, EmailInfo>(
+                emails.Count()
+            );
 
-            using (var telnetClient = new Client(
-                mxHostAddress,
-                port,
-                CancellationToken.None
-            ))
+            var mailsCount = emails.Count();
+            for (int i = 0; i < mailsCount; i += maxExecutions)
             {
-                foreach (var email in emails)
-                {
-                    var mailInfo = new EmailInfo
-                    {
-                        ProviderExists = false,
-                        EmailResolution = EmailResolutionType.CantDetemine
-                    };
+                var emailsToExecute = emails.Skip(i).Take(maxExecutions);
+                var allTasks = emailsToExecute.Select(
+                    p => CheckEmailAddresses(p, mxHostAddress, port)
+                );
 
+                //var allConvertedTasks = allTasks.ToArray();
+                //this coding style lock all async thread, so, it's useless
+                //Task.WaitAll(allConvertedTasks);
+                Console.Write("threads: {0}\r\n", allTasks.Count());
+                await Task.WhenAll(allTasks);
+
+                foreach (var task in allTasks)
+                {
+                    var taskResult = task.Result;
+                    if (!emailsChecklist.ContainsKey(taskResult.Email))
+                    {
+                        emailsChecklist.Add(taskResult.Email, taskResult);
+                    }
+                }
+            }
+
+            return emailsChecklist;
+        }
+
+        static async Task<EmailInfo> CheckEmailAddresses(
+            string email,
+            string mxHostAddress,
+            int port
+        )
+        {
+            Console.WriteLine(Thread.CurrentThread.ManagedThreadId);
+            var mailInfo = new EmailInfo
+            {
+                ProviderExists = false,
+                EmailResolution = EmailResolutionType.CantDetemine
+            };
+
+            try
+            {
+                using (var telnetClient = new Client(
+                    mxHostAddress,
+                    port,
+                    CancellationToken.None
+                ))
+                {
                     if (mailInfo.ProviderExists = telnetClient.IsConnected)
                     {
+                        mailInfo.Email = email;
                         await telnetClient.Write("HELO localhost\r\n");
-                        await telnetClient.ReadAsync(new TimeSpan(0, 1, 0));
+                        await telnetClient.ReadAsync(new TimeSpan(0, 0, 10));
 
                         await telnetClient.Write("MAIL FROM:<TEST@DOMAIN.com>\r\n");
-                        await telnetClient.ReadAsync(new TimeSpan(0, 1, 0));
+                        await telnetClient.ReadAsync(new TimeSpan(0, 0, 10));
 
                         await telnetClient.Write(
                             string.Format("RCPT TO:<{0}>\r\n", email)
@@ -249,20 +295,21 @@ namespace EmailChecker
 
                         if (response.StartsWith("2"))
                             mailInfo.EmailResolution = EmailResolutionType.Exist;
-                        else if (response.StartsWith("5"))
+                        else if (response.StartsWith("5") && response.Contains("exist"))
                             mailInfo.EmailResolution = EmailResolutionType.NotExist;
                         else
                             mailInfo.EmailResolution = EmailResolutionType.CantDetemine;
                     }
 
-                    emailsChecklist.Add(email, mailInfo);
+                    await telnetClient.Write("QUIT");
                 }
-
-                await telnetClient.Write("QUIT");
-
+            }
+            catch(Exception ex)
+            {
+                Console.WriteLine(ex.Message);
             }
 
-            return emailsChecklist;
+            return mailInfo;
         }
 
         class MxServerInfo
@@ -273,6 +320,7 @@ namespace EmailChecker
 
         class EmailInfo
         {
+            public string Email { get; set; }
             public bool ProviderExists { get; set; }
             public EmailResolutionType EmailResolution { get; set; }
         }
