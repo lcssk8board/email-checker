@@ -1,10 +1,13 @@
-﻿using PrimS.Telnet;
+﻿using log4net;
+using PrimS.Telnet;
+using ShellProgressBar;
 using System;
 using System.Collections.Generic;
 using System.Configuration;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -19,6 +22,10 @@ namespace EmailChecker
         const int SMTP_PORT = 25;
 
         static string[] emailsToValidate = new string[0];
+        static object _pbarLocker = new object();
+        static readonly ILog _log = LogManager.GetLogger(
+            MethodBase.GetCurrentMethod().DeclaringType
+        );
 
         static async Task MainAsync(string[] args)
         {
@@ -27,74 +34,79 @@ namespace EmailChecker
 
             emailsToValidate = File.ReadAllLines(fileList);
 
-            var allProviders = GetProvidersGrouped(emailsToValidate);
-
-            if (allProviders != null)
+            var maxTicks = emailsToValidate.Length;
+            using (var pbar = new ProgressBar(maxTicks, "Starting", ConsoleColor.Green, '\u2593'))
             {
-                var emailsChecklist = new Dictionary<string, EmailInfo>();
+                var allProviders = GetProvidersGrouped(emailsToValidate);
 
-                foreach (var provider in allProviders)
+                if (allProviders != null)
                 {
-                    try
+                    var emailsChecklist = new Dictionary<string, EmailInfo>();
+
+                    foreach (var provider in allProviders)
                     {
-                        var mxInfo = await FindServerInfoAsync(provider.Key);
-                        var allProvidersInfo = ParseMxServerResults(mxInfo);
+                        try
+                        {
+                            var mxInfo = await FindServerInfoAsync(provider.Key);
+                            var allProvidersInfo = ParseMxServerResults(mxInfo);
 
-                        var mxToUse = allProvidersInfo.OrderBy(
-                            p => p.Preference
-                        ).First();
+                            var mxToUse = allProvidersInfo.OrderBy(
+                                p => p.Preference
+                            ).FirstOrDefault();
 
-                        var emailsChecked = await CheckEmailsOrquestrator(
-                            32,
-                            provider.Value,
-                            mxToUse.Address,
-                            SMTP_PORT
+                            var emailsChecked = CheckEmailsOrquestrator(
+                                32,
+                                provider.Value,
+                                mxToUse?.Address,
+                                SMTP_PORT,
+                                pbar
+                            );
+
+                            foreach (var email in emailsChecked)
+                            {
+                                emailsChecklist.Add(
+                                    email.Key,
+                                    email.Value
+                                );
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _log.Error(string.Empty, ex);
+                        }
+                    }
+
+                    if (emailsChecklist != null && emailsChecklist.Count > 0)
+                    {
+                        var outputFileName = Path.Combine(
+                            outputFileList,
+                            string.Format(
+                                "output-{0}.csv",
+                                DateTime.Now.ToString("yyyyMMddHHmmssfff")
+                            )
                         );
 
-                        foreach (var email in emailsChecked)
+                        if (!Directory.Exists(outputFileList))
+                            Directory.CreateDirectory(outputFileList);
+
+                        using (var writer = new StreamWriter(outputFileName))
                         {
-                            emailsChecklist.Add(
-                                email.Key,
-                                email.Value
-                            );
+                            writer.WriteLine("email;provider;email;");
+
+                            foreach (var emailChecked in emailsChecklist)
+                            {
+                                writer.WriteLine(
+                                    string.Format(
+                                        "{0};{1};{2};",
+                                        emailChecked.Key,
+                                        emailChecked.Value.ProviderExists,
+                                        emailChecked.Value.EmailResolution
+                                    )
+                                );
+                            }
+
+                            writer.Flush();
                         }
-                    }
-                    catch(Exception ex)
-                    {
-                        Console.WriteLine(ex.Message);
-                    }
-                }
-
-                if (emailsChecklist != null && emailsChecklist.Count > 0)
-                {
-                    var outputFileName = Path.Combine(
-                        outputFileList,
-                        string.Format(
-                            "output-{0}.csv",
-                            DateTime.Now.ToString("yyyyMMddHHmmssfff")
-                        )
-                    );
-
-                    if (!Directory.Exists(outputFileList))
-                        Directory.CreateDirectory(outputFileList);
-
-                    using (var writer = new StreamWriter(outputFileName))
-                    {
-                        writer.WriteLine("email;provider;email;");
-
-                        foreach (var emailChecked in emailsChecklist)
-                        {
-                            writer.WriteLine(
-                                string.Format(
-                                    "{0};{1};{2};",
-                                    emailChecked.Key,
-                                    emailChecked.Value.ProviderExists,
-                                    emailChecked.Value.EmailResolution
-                                )
-                            );
-                        }
-
-                        writer.Flush();
                     }
                 }
             }
@@ -102,6 +114,7 @@ namespace EmailChecker
 
         static void Main(string[] args)
         {
+            log4net.Config.XmlConfigurator.Configure();
             MainAsync(args).Wait();
         }
 
@@ -153,7 +166,8 @@ namespace EmailChecker
                 nslookup.StartInfo.FileName = "nslookup";
                 nslookup.StartInfo.Arguments = string.Format("-type=mx {0}", provider);
                 nslookup.StartInfo.UseShellExecute = false;
-                nslookup.StartInfo.RedirectStandardOutput = true;
+                nslookup.StartInfo.RedirectStandardError =
+                    nslookup.StartInfo.RedirectStandardOutput = true;
                 nslookup.Start();
 
                 var result = await nslookup.StandardOutput.ReadToEndAsync();
@@ -219,11 +233,12 @@ namespace EmailChecker
             return mailExchangerList;
         }
 
-        static async Task<IReadOnlyDictionary<string, EmailInfo>> CheckEmailsOrquestrator(
+        static IReadOnlyDictionary<string, EmailInfo> CheckEmailsOrquestrator(
             int maxExecutions,
             IEnumerable<string> emails,
             string mxHostAddress,
-            int port
+            int port,
+            ProgressBar pbar
         )
         {
             var emailsChecklist = new Dictionary<string, EmailInfo>(
@@ -235,14 +250,10 @@ namespace EmailChecker
             {
                 var emailsToExecute = emails.Skip(i).Take(maxExecutions);
                 var allTasks = emailsToExecute.Select(
-                    p => CheckEmailAddresses(p, mxHostAddress, port)
-                );
+                    p => CheckEmailAddresses(p, mxHostAddress, port, pbar)
+                ).ToArray();
 
-                //var allConvertedTasks = allTasks.ToArray();
-                //this coding style lock all async thread, so, it's useless
-                //Task.WaitAll(allConvertedTasks);
-                Console.Write("threads: {0}\r\n", allTasks.Count());
-                await Task.WhenAll(allTasks);
+                Task.WaitAll(allTasks);
 
                 foreach (var task in allTasks)
                 {
@@ -260,53 +271,59 @@ namespace EmailChecker
         static async Task<EmailInfo> CheckEmailAddresses(
             string email,
             string mxHostAddress,
-            int port
+            int port,
+            ProgressBar pbar
         )
         {
-            Console.WriteLine(Thread.CurrentThread.ManagedThreadId);
+            pbar.Tick($"Currently processing: #{pbar.CurrentTick} emails searched...");
+
             var mailInfo = new EmailInfo
             {
+                Email = email,
                 ProviderExists = false,
                 EmailResolution = EmailResolutionType.CantDetemine
             };
 
             try
             {
-                using (var telnetClient = new Client(
-                    mxHostAddress,
-                    port,
-                    CancellationToken.None
-                ))
+                if (!string.IsNullOrEmpty(mxHostAddress) && !string.IsNullOrEmpty(email))
                 {
-                    if (mailInfo.ProviderExists = telnetClient.IsConnected)
+                    using (var telnetClient = new Client(
+                        mxHostAddress,
+                        port,
+                        CancellationToken.None
+                    ))
                     {
-                        mailInfo.Email = email;
-                        await telnetClient.Write("HELO localhost\r\n");
-                        await telnetClient.ReadAsync(new TimeSpan(0, 0, 10));
+                        if (mailInfo.ProviderExists = telnetClient.IsConnected)
+                        {
+                            mailInfo.Email = email;
+                            await telnetClient.Write("HELO localhost\r\n");
+                            await telnetClient.ReadAsync(new TimeSpan(0, 0, 10));
 
-                        await telnetClient.Write("MAIL FROM:<TEST@DOMAIN.com>\r\n");
-                        await telnetClient.ReadAsync(new TimeSpan(0, 0, 10));
+                            await telnetClient.Write("MAIL FROM:<TEST@DOMAIN.com>\r\n");
+                            await telnetClient.ReadAsync(new TimeSpan(0, 0, 10));
 
-                        await telnetClient.Write(
-                            string.Format("RCPT TO:<{0}>\r\n", email)
-                        );
+                            await telnetClient.Write(
+                                string.Format("RCPT TO:<{0}>\r\n", email)
+                            );
 
-                        var response = await telnetClient.ReadAsync(new TimeSpan(0, 1, 0));
+                            var response = await telnetClient.ReadAsync(new TimeSpan(0, 1, 0));
 
-                        if (response.StartsWith("2"))
-                            mailInfo.EmailResolution = EmailResolutionType.Exist;
-                        else if (response.StartsWith("5") && response.Contains("exist"))
-                            mailInfo.EmailResolution = EmailResolutionType.NotExist;
-                        else
-                            mailInfo.EmailResolution = EmailResolutionType.CantDetemine;
+                            if (response.StartsWith("2"))
+                                mailInfo.EmailResolution = EmailResolutionType.Exist;
+                            else if (response.StartsWith("5") && response.Contains("exist"))
+                                mailInfo.EmailResolution = EmailResolutionType.NotExist;
+                            else
+                                mailInfo.EmailResolution = EmailResolutionType.CantDetemine;
+                        }
+
+                        await telnetClient.Write("QUIT");
                     }
-
-                    await telnetClient.Write("QUIT");
                 }
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
-                Console.WriteLine(ex.Message);
+                _log.Error(string.Empty, ex);
             }
 
             return mailInfo;

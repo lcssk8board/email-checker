@@ -36,8 +36,16 @@
       <HintPath>..\packages\LiteGuard.0.10.0\lib\net35\LiteGuard.dll</HintPath>
       <Private>True</Private>
     </Reference>
+    <Reference Include="log4net, Version=1.2.15.0, Culture=neutral, PublicKeyToken=669e0ddf0bb1aa2a, processorArchitecture=MSIL">
+      <HintPath>..\packages\log4net.2.0.5\lib\net45-full\log4net.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
     <Reference Include="PrimS.Telnet, Version=0.4.0.0, Culture=neutral, processorArchitecture=MSIL">
       <HintPath>..\packages\Telnet.0.4.0\lib\net45\PrimS.Telnet.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="ShellProgressBar, Version=1.2.0.0, Culture=neutral, PublicKeyToken=9bdeb49e926d68fa, processorArchitecture=MSIL">
+      <HintPath>..\packages\ShellProgressBar.1.2.0.0\lib\NET4\ShellProgressBar.dll</HintPath>
       <Private>True</Private>
     </Reference>
     <Reference Include="System" />
